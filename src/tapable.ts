@@ -41,6 +41,8 @@ export class AsyncHook {
   }
 
   callAsync(data: any, callback: (err?: any) => void) {
+    if (!this.name) callback();
+
     try {
       this.eventEmitter.emit(this.name, data, callback);
     } catch (error) {
@@ -49,6 +51,8 @@ export class AsyncHook {
   }
 
   promise(data: any) {
+    if (!this.name) return Promise.resolve();
+
     return this.eventEmitter.emit(this.name, data);
   }
 }

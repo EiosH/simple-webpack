@@ -6,9 +6,17 @@ const babel = require("@babel/core");
 
 const { AsyncHook, SyncHook } = require("./tapable");
 
+enum DependencyType {
+  NORMAL = 0,
+  LAZY = 1,
+}
+interface Dependency {
+  fileName: string;
+  type?: DependencyType;
+}
 interface Module {
   fileName: string;
-  dependencies: string[];
+  dependencies: Dependency[];
   code: string;
   id: number;
   map: Record<string, number>;
@@ -59,13 +67,27 @@ const createModule = (fileName: string, id: number, rules?: Rule[]) => {
   const ast = parser.parse(code, { sourceType: "module" });
 
   // 依赖收集
-  const dependencies: string[] = [];
+  const dependencies: Dependency[] = [];
 
   // 使用 traverse 来遍历 AST
   traverse(ast, {
     ImportDeclaration({ node }: { node: any }) {
       let path = node.source.value;
-      dependencies.push(path);
+      dependencies.push({
+        fileName: path,
+      });
+    },
+
+    CallExpression(path: { node: any }) {
+      const { node } = path;
+
+      if (node.callee.type === "Import") {
+        const path = node.arguments[0].value;
+        dependencies.push({
+          fileName: path,
+          type: DependencyType.LAZY,
+        });
+      }
     },
   });
 
@@ -86,36 +108,75 @@ const createModule = (fileName: string, id: number, rules?: Rule[]) => {
 function createDependenceMap(fileName: string, rules?: Rule[]) {
   let globalId = 0;
   const fileNameQueue = [fileName];
-  const moduleQueue: Module[] = [];
+  const moduleQueue: Array<Module & { lazy: boolean }> = [];
+  const lazyModuleQueue: string[] = [];
 
   for (let index = 0; index < fileNameQueue.length; index++) {
     const filename = fileNameQueue[index];
     const module = createModule(filename, Number(index), rules);
-    moduleQueue.push(module);
+    moduleQueue.push({
+      ...module,
+      lazy: lazyModuleQueue.includes(module.fileName),
+    });
 
-    module.dependencies.forEach((dependencePath: string) => {
+    module.dependencies.forEach(({ fileName: dependencePath, type }) => {
       module.map[dependencePath] = ++globalId;
       const dirname = path.dirname(fileName);
       const absolutePath = `./${path.join(dirname, dependencePath)}`;
 
       fileNameQueue.push(absolutePath);
+      if (type === DependencyType.LAZY) {
+        lazyModuleQueue.push(absolutePath);
+      }
     });
   }
+
   // 返回模块队列
   return moduleQueue;
 }
 
-function getBoundle(dependenceGraph: Module[]) {
+function getBoundle(dependenceGraph: Array<Module & { lazy: boolean }>) {
   let modules = "";
 
   // 对依赖模块进行处理
   dependenceGraph.forEach((module) => {
     modules += `${module.id}: [
        function (require, module, exports) {
-         ${module.code}
+         ${
+           module.lazy
+             ? `
+             const res = new Promise((resolve, reject) => {
+              resolve({a:1})
+
+              const document = self.document;
+              const script = document.createElement("script");
+              script.src = "../output/${module.id}.js";
+              document.head.append(script);
+              script.onload = ()=>{
+                self.lazyChunk${module.id}(require, module, exports)
+
+                resolve(exports)
+              };
+              script.onerror = reject;
+            });
+
+            return res
+        `
+             : module.code
+         }
        },
        ${JSON.stringify(module.map)},
      ],`;
+
+    if (module.lazy) {
+      write(
+        `./output/${module.id}.js`,
+        `
+        self.lazyChunk${module.id} = (require, module, exports) => {
+          ${module.code}
+        }`
+      );
+    }
   });
 
   modules = modules.slice(0, -1);
